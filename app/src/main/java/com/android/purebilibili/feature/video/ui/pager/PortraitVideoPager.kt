@@ -1,0 +1,1273 @@
+package com.android.purebilibili.feature.video.ui.pager
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.pager.VerticalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.key
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.ui.PlayerView
+import coil.compose.AsyncImage
+import com.android.purebilibili.core.network.NetworkModule
+import com.android.purebilibili.core.store.PlaybackCompletionBehavior
+import com.android.purebilibili.core.store.SettingsManager
+import com.android.purebilibili.core.store.TokenManager
+import com.android.purebilibili.core.util.FormatUtils
+import com.android.purebilibili.data.model.response.RelatedVideo
+import com.android.purebilibili.data.model.response.ViewInfo
+import com.android.purebilibili.feature.video.player.PlaylistManager
+import com.android.purebilibili.feature.video.danmaku.DanmakuManager
+import com.android.purebilibili.feature.video.danmaku.FaceOcclusionDanmakuContainer
+import com.android.purebilibili.feature.video.danmaku.FaceOcclusionMaskStabilizer
+import com.android.purebilibili.feature.video.danmaku.FaceOcclusionModuleState
+import com.android.purebilibili.feature.video.danmaku.FaceOcclusionVisualMask
+import com.android.purebilibili.feature.video.danmaku.checkFaceOcclusionModuleState
+import com.android.purebilibili.feature.video.danmaku.createFaceOcclusionDetector
+import com.android.purebilibili.feature.video.danmaku.detectFaceOcclusionRegions
+import com.android.purebilibili.feature.video.danmaku.rememberDanmakuManager
+import com.android.purebilibili.feature.video.ui.overlay.PlayerProgress
+import com.android.purebilibili.feature.video.ui.components.VideoAspectRatio
+import com.android.purebilibili.feature.video.ui.overlay.PortraitFullscreenOverlay
+import com.android.purebilibili.feature.video.viewmodel.PlaybackEndAction
+import com.android.purebilibili.feature.video.viewmodel.PlayerUiState
+import com.android.purebilibili.feature.video.viewmodel.PlayerViewModel
+import com.android.purebilibili.feature.video.viewmodel.resolvePlaybackEndAction
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+
+/**
+ * 竖屏无缝滑动播放页面 (TikTok Style)
+ * 
+ * @param initialBvid 初始视频 BVID
+ * @param initialInfo 初始视频详情
+ * @param recommendations 推荐视频列表
+ * @param onBack 返回回调
+ * @param onVideoChange 切换视频回调 (当滑动到新视频时通知外部)
+ */
+import com.android.purebilibili.feature.video.viewmodel.VideoCommentViewModel
+
+@UnstableApi
+@Composable
+fun PortraitVideoPager(
+    initialBvid: String,
+    initialInfo: ViewInfo,
+    recommendations: List<RelatedVideo>,
+    onBack: () -> Unit,
+    onVideoChange: (String) -> Unit,
+    viewModel: PlayerViewModel,
+    commentViewModel: VideoCommentViewModel,
+    sharedPlayer: ExoPlayer? = null,
+    initialStartPositionMs: Long = 0L,
+    onProgressUpdate: (String, Long) -> Unit = { _, _ -> },
+    onExitSnapshot: (String, Long) -> Unit = { _, _ -> },
+    onSearchClick: () -> Unit = {},
+    onUserClick: (Long) -> Unit,
+    onRotateToLandscape: () -> Unit
+) {
+    val context = LocalContext.current
+    val useSharedPlayer = sharedPlayer != null
+    val entryStartPositionMs = remember(initialBvid) { initialStartPositionMs.coerceAtLeast(0L) }
+    val scope = rememberCoroutineScope()
+    val danmakuManager = rememberDanmakuManager()
+    val danmakuEnabled by SettingsManager
+        .getDanmakuEnabled(context)
+        .collectAsState(initial = true)
+    val danmakuOpacity by SettingsManager
+        .getDanmakuOpacity(context)
+        .collectAsState(initial = 0.85f)
+    val danmakuFontScale by SettingsManager
+        .getDanmakuFontScale(context)
+        .collectAsState(initial = 1.0f)
+    val danmakuSpeed by SettingsManager
+        .getDanmakuSpeed(context)
+        .collectAsState(initial = 1.0f)
+    val danmakuDisplayArea by SettingsManager
+        .getDanmakuArea(context)
+        .collectAsState(initial = 0.5f)
+    val danmakuMergeDuplicates by SettingsManager
+        .getDanmakuMergeDuplicates(context)
+        .collectAsState(initial = true)
+    val danmakuAllowScroll by SettingsManager
+        .getDanmakuAllowScroll(context)
+        .collectAsState(initial = true)
+    val danmakuAllowTop by SettingsManager
+        .getDanmakuAllowTop(context)
+        .collectAsState(initial = true)
+    val danmakuAllowBottom by SettingsManager
+        .getDanmakuAllowBottom(context)
+        .collectAsState(initial = true)
+    val danmakuAllowColorful by SettingsManager
+        .getDanmakuAllowColorful(context)
+        .collectAsState(initial = true)
+    val danmakuAllowSpecial by SettingsManager
+        .getDanmakuAllowSpecial(context)
+        .collectAsState(initial = true)
+    val danmakuSmartOcclusion by SettingsManager
+        .getDanmakuSmartOcclusion(context)
+        .collectAsState(initial = false)
+    val faceDetector = remember { createFaceOcclusionDetector() }
+    var smartOcclusionModuleState by remember { mutableStateOf(FaceOcclusionModuleState.Checking) }
+    DisposableEffect(faceDetector) {
+        onDispose { faceDetector.close() }
+    }
+    LaunchedEffect(faceDetector, danmakuSmartOcclusion) {
+        if (!danmakuSmartOcclusion) {
+            smartOcclusionModuleState = FaceOcclusionModuleState.NotInstalled
+            return@LaunchedEffect
+        }
+        smartOcclusionModuleState = FaceOcclusionModuleState.Checking
+        smartOcclusionModuleState = checkFaceOcclusionModuleState(context, faceDetector)
+    }
+    val autoPlayEnabled by SettingsManager
+        .getAutoPlay(context)
+        .collectAsState(initial = true)
+    val playbackCompletionBehavior by SettingsManager
+        .getPlaybackCompletionBehavior(context)
+        .collectAsState(initial = PlaybackCompletionBehavior.CONTINUE_CURRENT_LOGIC)
+    val isExternalPlaylist by PlaylistManager.isExternalPlaylist.collectAsState()
+
+    val baseRecommendations = remember {
+        recommendations.distinctBy { it.bvid }
+    }
+    val initialPageIndex = remember(initialBvid, initialInfo.bvid, baseRecommendations) {
+        resolvePortraitInitialPageIndex(
+            initialBvid = initialBvid,
+            initialInfoBvid = initialInfo.bvid,
+            recommendations = baseRecommendations
+        )
+    }
+    val pageItems = remember {
+        mutableStateListOf<Any>().apply {
+            add(initialInfo)
+            addAll(baseRecommendations)
+        }
+    }
+    var watchLaterVideos by remember { mutableStateOf<List<RelatedVideo>>(emptyList()) }
+
+    LaunchedEffect(Unit) {
+        if (TokenManager.sessDataCache.isNullOrEmpty()) {
+            watchLaterVideos = emptyList()
+            return@LaunchedEffect
+        }
+        runCatching { NetworkModule.api.getWatchLaterList() }
+            .onSuccess { response ->
+                if (response.code == 0) {
+                    watchLaterVideos = response.data?.list
+                        .orEmpty()
+                        .mapNotNull(::toRelatedVideoFromWatchLater)
+                        .distinctBy { it.bvid }
+                }
+            }
+            .onFailure {
+                watchLaterVideos = emptyList()
+            }
+    }
+
+    LaunchedEffect(watchLaterVideos) {
+        if (watchLaterVideos.isEmpty()) return@LaunchedEffect
+        val existingBvids = pageItems.mapNotNull {
+            when (it) {
+                is ViewInfo -> it.bvid
+                is RelatedVideo -> it.bvid
+                else -> null
+            }
+        }.toSet()
+        val appendItems = watchLaterVideos.filter { it.bvid !in existingBvids }
+        if (appendItems.isNotEmpty()) {
+            pageItems.addAll(appendItems)
+        }
+    }
+    
+    val pagerState = rememberPagerState(initialPage = initialPageIndex) {
+        pageItems.size
+    }
+
+    // [重构] 优先复用主播放器；仅在未传入 sharedPlayer 时才创建页内播放器
+    val exoPlayer = sharedPlayer ?: remember(context) {
+        ExoPlayer.Builder(context)
+            .setAudioAttributes(
+                androidx.media3.common.AudioAttributes.Builder()
+                    .setUsage(androidx.media3.common.C.USAGE_MEDIA)
+                    .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MOVIE)
+                    .build(),
+                true
+            )
+            .build()
+            .apply {
+                repeatMode = Player.REPEAT_MODE_ONE
+                volume = 1.0f
+            }
+    }
+
+    if (!useSharedPlayer) {
+        DisposableEffect(exoPlayer) {
+            onDispose {
+                exoPlayer.release()
+            }
+        }
+    }
+
+    val sharedPlayerHasFrameAtEntry = remember(useSharedPlayer, exoPlayer) {
+        useSharedPlayer &&
+            exoPlayer.videoSize.width > 0 &&
+            exoPlayer.videoSize.height > 0
+    }
+
+    val sharedPlayerShouldResumeAtEntry = remember(useSharedPlayer, exoPlayer) {
+        useSharedPlayer && (exoPlayer.playWhenReady || exoPlayer.isPlaying)
+    }
+
+    // [状态] 当前播放的视频 URL
+    var currentPlayingBvid by remember(initialBvid, useSharedPlayer) {
+        mutableStateOf(
+            resolvePortraitInitialPlayingBvid(
+                useSharedPlayer = useSharedPlayer,
+                initialBvid = initialBvid
+            )
+        )
+    }
+    var currentPlayingCid by remember(initialInfo.cid, useSharedPlayer) {
+        mutableStateOf(if (useSharedPlayer) initialInfo.cid else 0L)
+    }
+    var currentPlayingAid by remember(initialInfo.aid, useSharedPlayer) {
+        mutableStateOf(if (useSharedPlayer) initialInfo.aid else 0L)
+    }
+    var isLoading by remember { mutableStateOf(false) }
+    var lastCommittedPage by remember(useSharedPlayer) {
+        mutableIntStateOf(if (useSharedPlayer) 0 else -1)
+    }
+    var activeLoadGeneration by remember { mutableIntStateOf(0) }
+    var hasConsumedInitialSeek by remember(useSharedPlayer) { mutableStateOf(useSharedPlayer) }
+    var pendingAutoPlayGeneration by remember { mutableIntStateOf(-1) }
+    var renderedFirstFrameGeneration by remember(useSharedPlayer, sharedPlayerHasFrameAtEntry) {
+        mutableIntStateOf(if (sharedPlayerHasFrameAtEntry) 0 else -1)
+    }
+    var lastAutoAdvancedBvid by remember { mutableStateOf<String?>(null) }
+
+    DisposableEffect(exoPlayer) {
+        danmakuManager.attachPlayer(exoPlayer)
+        onDispose { }
+    }
+
+    DisposableEffect(exoPlayer, activeLoadGeneration) {
+        val autoPlayListener = object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY &&
+                    pendingAutoPlayGeneration == activeLoadGeneration &&
+                    !exoPlayer.isPlaying
+                ) {
+                    exoPlayer.playWhenReady = true
+                    exoPlayer.play()
+                }
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (isPlaying && pendingAutoPlayGeneration == activeLoadGeneration) {
+                    pendingAutoPlayGeneration = -1
+                }
+            }
+
+            override fun onRenderedFirstFrame() {
+                renderedFirstFrameGeneration = activeLoadGeneration
+                isLoading = false
+            }
+        }
+        exoPlayer.addListener(autoPlayListener)
+        onDispose {
+            exoPlayer.removeListener(autoPlayListener)
+        }
+    }
+
+    LaunchedEffect(useSharedPlayer, sharedPlayerShouldResumeAtEntry) {
+        if (useSharedPlayer && sharedPlayerShouldResumeAtEntry) {
+            exoPlayer.playWhenReady = true
+            if (!exoPlayer.isPlaying) {
+                exoPlayer.play()
+            }
+        }
+    }
+
+    DisposableEffect(
+        exoPlayer,
+        pagerState,
+        pageItems.size,
+        currentPlayingBvid,
+        autoPlayEnabled,
+        playbackCompletionBehavior,
+        isExternalPlaylist
+    ) {
+        val autoAdvanceListener = object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState != Player.STATE_ENDED) return
+                when (
+                    resolvePlaybackEndAction(
+                        behavior = playbackCompletionBehavior,
+                        autoPlayEnabled = autoPlayEnabled,
+                        isExternalPlaylist = isExternalPlaylist
+                    )
+                ) {
+                    PlaybackEndAction.STOP -> return
+                    PlaybackEndAction.REPEAT_CURRENT -> {
+                        exoPlayer.seekTo(0)
+                        exoPlayer.playWhenReady = true
+                        exoPlayer.play()
+                    }
+                    PlaybackEndAction.PLAY_NEXT_IN_PLAYLIST,
+                    PlaybackEndAction.AUTO_CONTINUE -> {
+                        val playingBvid = currentPlayingBvid ?: return
+                        if (lastAutoAdvancedBvid == playingBvid) return
+                        lastAutoAdvancedBvid = playingBvid
+
+                        val currentPage = pagerState.currentPage
+                        val nextPage = (currentPage + 1).coerceAtMost(pageItems.lastIndex)
+                        if (nextPage <= currentPage) return
+
+                        scope.launch {
+                            pagerState.animateScrollToPage(nextPage)
+                        }
+                    }
+                    PlaybackEndAction.PLAY_NEXT_IN_PLAYLIST_LOOP -> {
+                        val playingBvid = currentPlayingBvid ?: return
+                        if (lastAutoAdvancedBvid == playingBvid) return
+                        lastAutoAdvancedBvid = playingBvid
+
+                        val currentPage = pagerState.currentPage
+                        val nextPage = if (currentPage < pageItems.lastIndex) {
+                            currentPage + 1
+                        } else {
+                            0
+                        }
+                        scope.launch {
+                            pagerState.animateScrollToPage(nextPage)
+                        }
+                    }
+                }
+            }
+        }
+        exoPlayer.addListener(autoAdvanceListener)
+        onDispose {
+            exoPlayer.removeListener(autoAdvanceListener)
+        }
+    }
+
+    // [核心] 仅在页面 settle 后切流，避免拖动过程频繁切换导致卡顿与竞态
+    LaunchedEffect(pagerState, pageItems) {
+        snapshotFlow {
+            resolveCommittedPage(
+                isScrollInProgress = pagerState.isScrollInProgress,
+                currentPage = pagerState.currentPage,
+                lastCommittedPage = lastCommittedPage
+            )
+        }
+            .filterNotNull()
+            .distinctUntilChanged()
+            .collect { committedPage ->
+                lastCommittedPage = committedPage
+                val item = pageItems.getOrNull(committedPage) ?: return@collect
+
+                val bvid = if (item is ViewInfo) item.bvid else (item as RelatedVideo).bvid
+                val aid = if (item is ViewInfo) item.aid else (item as RelatedVideo).aid.toLong()
+
+                onVideoChange(bvid)
+
+                if (currentPlayingBvid == bvid) {
+                    isLoading = false
+                    return@collect
+                }
+
+                activeLoadGeneration += 1
+                val requestGeneration = activeLoadGeneration
+
+                exoPlayer.stop()
+                exoPlayer.clearMediaItems()
+                danmakuManager.clear()
+                isLoading = true
+                currentPlayingBvid = bvid
+                currentPlayingCid = 0L
+                currentPlayingAid = aid
+                pendingAutoPlayGeneration = requestGeneration
+                renderedFirstFrameGeneration = -1
+
+                launch {
+                    try {
+                        val result = com.android.purebilibili.data.repository.VideoRepository.getVideoDetails(
+                            bvid = bvid,
+                            aid = aid,
+                            targetQuality = 64
+                        )
+
+                        result.fold(
+                            onSuccess = { (info, playData) ->
+                                val videoUrl = playData.dash?.video?.firstOrNull()?.baseUrl
+                                    ?: playData.durl?.firstOrNull()?.url
+                                val audioUrl = playData.dash?.audio?.firstOrNull()?.baseUrl
+
+                                if (videoUrl.isNullOrEmpty()) {
+                                    pendingAutoPlayGeneration = -1
+                                    if (shouldApplyLoadResult(
+                                            requestGeneration = requestGeneration,
+                                            activeGeneration = activeLoadGeneration,
+                                            expectedBvid = bvid,
+                                            currentPlayingBvid = currentPlayingBvid
+                                        )
+                                    ) {
+                                        isLoading = false
+                                    }
+                                    return@fold
+                                }
+
+                                val headers = mapOf(
+                                    "Referer" to "https://www.bilibili.com",
+                                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                                )
+                                val dataSourceFactory = androidx.media3.datasource.DefaultHttpDataSource.Factory()
+                                    .setUserAgent(headers["User-Agent"])
+                                    .setDefaultRequestProperties(headers)
+                                val mediaSourceFactory = DefaultMediaSourceFactory(context)
+                                    .setDataSourceFactory(dataSourceFactory)
+
+                                val videoSource = mediaSourceFactory.createMediaSource(MediaItem.fromUri(videoUrl))
+                                val finalSource = if (!audioUrl.isNullOrEmpty()) {
+                                    val audioSource = mediaSourceFactory.createMediaSource(MediaItem.fromUri(audioUrl))
+                                    MergingMediaSource(videoSource, audioSource)
+                                } else {
+                                    videoSource
+                                }
+
+                                if (!shouldApplyLoadResult(
+                                        requestGeneration = requestGeneration,
+                                        activeGeneration = activeLoadGeneration,
+                                        expectedBvid = bvid,
+                                        currentPlayingBvid = currentPlayingBvid
+                                    )
+                                ) {
+                                    com.android.purebilibili.core.util.Logger.d(
+                                        "PortraitVideoPager",
+                                        "Discarded stale video load for $bvid (request=$requestGeneration, active=$activeLoadGeneration, current=$currentPlayingBvid)"
+                                    )
+                                    return@fold
+                                }
+
+                                currentPlayingCid = info.cid
+                                currentPlayingAid = info.aid
+                                exoPlayer.playWhenReady = true
+                                exoPlayer.setMediaSource(finalSource)
+                                exoPlayer.prepare()
+
+                                if (committedPage == 0 && entryStartPositionMs > 0 && !hasConsumedInitialSeek) {
+                                    exoPlayer.seekTo(entryStartPositionMs)
+                                    hasConsumedInitialSeek = true
+                                }
+
+                                exoPlayer.play()
+                            },
+                            onFailure = {
+                                pendingAutoPlayGeneration = -1
+                                if (shouldApplyLoadResult(
+                                        requestGeneration = requestGeneration,
+                                        activeGeneration = activeLoadGeneration,
+                                        expectedBvid = bvid,
+                                        currentPlayingBvid = currentPlayingBvid
+                                    )
+                                ) {
+                                    isLoading = false
+                                }
+                            }
+                        )
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        pendingAutoPlayGeneration = -1
+                        if (shouldApplyLoadResult(
+                                requestGeneration = requestGeneration,
+                                activeGeneration = activeLoadGeneration,
+                                expectedBvid = bvid,
+                                currentPlayingBvid = currentPlayingBvid
+                            )
+                        ) {
+                            isLoading = false
+                        }
+                    }
+                }
+            }
+    }
+
+    LaunchedEffect(currentPlayingCid, currentPlayingAid, danmakuEnabled, exoPlayer) {
+        if (currentPlayingCid > 0 && danmakuEnabled) {
+            danmakuManager.isEnabled = true
+            var durationMs = exoPlayer.duration
+            var retries = 0
+            while (durationMs <= 0 && retries < 50) {
+                delay(100)
+                durationMs = exoPlayer.duration
+                retries++
+            }
+            danmakuManager.loadDanmaku(currentPlayingCid, currentPlayingAid, durationMs.coerceAtLeast(0L))
+        } else {
+            danmakuManager.isEnabled = false
+        }
+    }
+
+    LaunchedEffect(
+        danmakuOpacity,
+        danmakuFontScale,
+        danmakuSpeed,
+        danmakuDisplayArea,
+        danmakuMergeDuplicates,
+        danmakuAllowScroll,
+        danmakuAllowTop,
+        danmakuAllowBottom,
+        danmakuAllowColorful,
+        danmakuAllowSpecial,
+        danmakuSmartOcclusion
+    ) {
+        danmakuManager.updateSettings(
+            opacity = danmakuOpacity,
+            fontScale = danmakuFontScale,
+            speed = danmakuSpeed,
+            displayArea = danmakuDisplayArea,
+            mergeDuplicates = danmakuMergeDuplicates,
+            allowScroll = danmakuAllowScroll,
+            allowTop = danmakuAllowTop,
+            allowBottom = danmakuAllowBottom,
+            allowColorful = danmakuAllowColorful,
+            allowSpecial = danmakuAllowSpecial,
+            // Mask-only mode: keep lane layout fixed, do not move danmaku tracks.
+            smartOcclusion = false
+        )
+    }
+
+    VerticalPager(
+        state = pagerState,
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+    ) { page ->
+        val item = pageItems.getOrNull(page)
+        
+        if (item != null) {
+            VideoPageItem(
+                item = item,
+                isCurrentPage = page == pagerState.currentPage,
+                onBack = onBack,
+                viewModel = viewModel,
+                commentViewModel = commentViewModel,
+                exoPlayer = exoPlayer, // [核心] 传递共享播放器
+                currentPlayingBvid = currentPlayingBvid, // [修复] 传递当前播放的 BVID 用于校验
+                isLoading = if (page == pagerState.currentPage) isLoading else false, // 只有当前页显示 Loading
+                danmakuManager = danmakuManager,
+                danmakuEnabled = danmakuEnabled,
+                danmakuSmartOcclusion = danmakuSmartOcclusion,
+                faceDetector = faceDetector,
+                smartOcclusionModuleState = smartOcclusionModuleState,
+                onExitSnapshot = onExitSnapshot,
+                onSearchClick = onSearchClick,
+                onUserClick = onUserClick,
+                onRotateToLandscape = onRotateToLandscape,
+                onProgressUpdate = onProgressUpdate,
+                watchLaterVideos = watchLaterVideos,
+                recommendationVideos = baseRecommendations,
+                hasRenderedFirstFrame = (renderedFirstFrameGeneration == activeLoadGeneration),
+                initialProgressPositionMs = resolvePortraitInitialProgressPosition(
+                    isFirstPage = page == 0,
+                    initialStartPositionMs = entryStartPositionMs
+                ),
+                onRequestVideoChange = { targetBvid ->
+                    val targetIndex = pageItems.indexOfFirst { candidate ->
+                        when (candidate) {
+                            is ViewInfo -> candidate.bvid == targetBvid
+                            is RelatedVideo -> candidate.bvid == targetBvid
+                            else -> false
+                        }
+                    }
+                    if (targetIndex >= 0) {
+                        scope.launch {
+                            pagerState.animateScrollToPage(targetIndex)
+                        }
+                    }
+                }
+            )
+        }
+    }
+}
+
+@UnstableApi
+@Composable
+private fun VideoPageItem(
+    item: Any,
+    isCurrentPage: Boolean,
+    onBack: () -> Unit,
+    viewModel: PlayerViewModel,
+    commentViewModel: VideoCommentViewModel,
+    exoPlayer: ExoPlayer,
+    currentPlayingBvid: String?, // [新增]
+    isLoading: Boolean,
+    danmakuManager: DanmakuManager,
+    danmakuEnabled: Boolean,
+    danmakuSmartOcclusion: Boolean,
+    faceDetector: com.google.mlkit.vision.face.FaceDetector,
+    smartOcclusionModuleState: FaceOcclusionModuleState,
+    onExitSnapshot: (String, Long) -> Unit,
+    onSearchClick: () -> Unit,
+    onUserClick: (Long) -> Unit,
+    onRotateToLandscape: () -> Unit,
+    onProgressUpdate: (String, Long) -> Unit,
+    watchLaterVideos: List<RelatedVideo>,
+    recommendationVideos: List<RelatedVideo>,
+    hasRenderedFirstFrame: Boolean,
+    initialProgressPositionMs: Long,
+    onRequestVideoChange: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var playerViewRef by remember { mutableStateOf<PlayerView?>(null) }
+    var faceVisualMasks by remember { mutableStateOf(emptyList<FaceOcclusionVisualMask>()) }
+    val faceMaskStabilizer = remember { FaceOcclusionMaskStabilizer() }
+    val longPressSpeed by SettingsManager
+        .getLongPressSpeed(context)
+        .collectAsState(initial = 1.75f)
+    
+    // [修复] 手动监听 ExoPlayer 播放状态，确保 UI 及时更新
+    var isPlaying by remember { mutableStateOf(exoPlayer.isPlaying) }
+    var currentVideoAspect by remember {
+        mutableFloatStateOf(
+            exoPlayer.videoSize
+                .takeIf { it.width > 0 && it.height > 0 }
+                ?.let { it.width.toFloat() / it.height.toFloat() }
+                ?: (16f / 9f)
+        )
+    }
+    
+    DisposableEffect(exoPlayer) {
+        val listener = object : Player.Listener {
+            override fun onIsPlayingChanged(isPlaying_: Boolean) {
+                isPlaying = isPlaying_
+            }
+
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    currentVideoAspect = videoSize.width.toFloat() / videoSize.height.toFloat()
+                }
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose {
+            exoPlayer.removeListener(listener)
+        }
+    }
+    
+    // 提取信息
+    val bvid = if (item is ViewInfo) item.bvid else (item as RelatedVideo).bvid
+    val aid = if (item is ViewInfo) item.aid else (item as RelatedVideo).aid.toLong()
+    // [逻辑] 只有当播放器正在播放当前视频时，才显示 PlayerView
+    val isPlayerReadyForThisVideo = bvid == currentPlayingBvid
+    val title = if (item is ViewInfo) item.title else (item as RelatedVideo).title
+    val cover = if (item is ViewInfo) item.pic else (item as RelatedVideo).pic
+    val authorName = if (item is ViewInfo) item.owner.name else (item as RelatedVideo).owner.name
+    val authorFace = if (item is ViewInfo) item.owner.face else (item as RelatedVideo).owner.face
+    val authorMid = if (item is ViewInfo) item.owner.mid else (item as RelatedVideo).owner.mid
+
+    // 提取时长
+    val initialDuration = if (item is RelatedVideo) {
+        item.duration * 1000L
+    } else if (item is ViewInfo) {
+        (item.pages.firstOrNull()?.duration ?: 0L) * 1000L
+    } else {
+        0L
+    }
+
+    // 互动状态
+    var showCommentSheet by remember { mutableStateOf(false) }
+    var showDetailSheet by remember { mutableStateOf(false) }
+    var detailSheetUpOnlyMode by remember { mutableStateOf(false) }
+    var isOverlayVisible by remember { mutableStateOf(true) }
+
+    // 进度状态 (从播放器获取)
+    var progressState by remember(bvid, initialDuration, initialProgressPositionMs) {
+        mutableStateOf(
+            PlayerProgress(
+                current = initialProgressPositionMs.coerceAtLeast(0L),
+                duration = initialDuration,
+                buffered = initialProgressPositionMs.coerceAtLeast(0L)
+            )
+        )
+    }
+    
+    // 如果是当前页，监听播放器进度
+    LaunchedEffect(isCurrentPage, exoPlayer, hasRenderedFirstFrame) {
+        if (isCurrentPage) {
+            while (true) {
+                if (isPlayerReadyForThisVideo) {
+                    val playerPosition = exoPlayer.currentPosition.coerceAtLeast(0L)
+                    val effectivePosition = if (
+                        playerPosition == 0L &&
+                        progressState.current > 0L &&
+                        !hasRenderedFirstFrame
+                    ) {
+                        progressState.current
+                    } else {
+                        playerPosition
+                    }
+                    val realDuration = if (exoPlayer.duration > 0) exoPlayer.duration else initialDuration
+                    progressState = PlayerProgress(
+                        current = effectivePosition,
+                        duration = realDuration,
+                        buffered = exoPlayer.bufferedPosition
+                    )
+                    if (exoPlayer.isPlaying || effectivePosition > 0L) {
+                        onProgressUpdate(bvid, effectivePosition)
+                    }
+                }
+                delay(200)
+            }
+        }
+    }
+    
+    // 手势调整进度状态
+    var isSeekGesture by remember { mutableStateOf(false) }
+    var seekStartPosition by remember { mutableFloatStateOf(0f) }
+    var seekTargetPosition by remember { mutableFloatStateOf(0f) }
+    var isLongPressing by remember { mutableStateOf(false) }
+    var longPressOriginSpeed by remember { mutableFloatStateOf(1f) }
+    var showLongPressSpeedFeedback by remember { mutableStateOf(false) }
+
+    LaunchedEffect(
+        playerViewRef,
+        isCurrentPage,
+        isPlayerReadyForThisVideo,
+        danmakuEnabled,
+        danmakuSmartOcclusion,
+        smartOcclusionModuleState
+    ) {
+        if (
+            !isCurrentPage ||
+            !isPlayerReadyForThisVideo ||
+            !danmakuEnabled ||
+            !danmakuSmartOcclusion ||
+            smartOcclusionModuleState != FaceOcclusionModuleState.Ready
+        ) {
+            faceMaskStabilizer.reset()
+            faceVisualMasks = emptyList()
+            return@LaunchedEffect
+        }
+        faceMaskStabilizer.reset()
+
+        while (isActive) {
+            val view = playerViewRef
+            if (view == null || view.width <= 0 || view.height <= 0 || !exoPlayer.isPlaying) {
+                delay(1200L)
+                continue
+            }
+
+            val videoWidth = exoPlayer.videoSize.width
+            val videoHeight = exoPlayer.videoSize.height
+            val sampleWidth = 480
+            val sampleHeight = when {
+                videoWidth > 0 && videoHeight > 0 -> (sampleWidth * videoHeight / videoWidth).coerceIn(270, 960)
+                else -> 270
+            }
+
+            val detection = withTimeoutOrNull(1_500L) {
+                detectFaceOcclusionRegions(
+                    playerView = view,
+                    sampleWidth = sampleWidth,
+                    sampleHeight = sampleHeight,
+                    detector = faceDetector
+                )
+            } ?: com.android.purebilibili.feature.video.danmaku.FaceOcclusionDetectionResult(
+                verticalRegions = emptyList(),
+                maskRects = emptyList(),
+                visualMasks = emptyList()
+            )
+            faceVisualMasks = faceMaskStabilizer.step(detection.visualMasks)
+            delay(if (detection.visualMasks.isEmpty()) 1300L else 900L)
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = { isOverlayVisible = !isOverlayVisible },
+                    onDoubleTap = {
+                        if (isCurrentPage) {
+                            if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
+                        }
+                    },
+                    onLongPress = {
+                        if (!isCurrentPage) return@detectTapGestures
+                        longPressOriginSpeed = exoPlayer.playbackParameters.speed
+                        exoPlayer.setPlaybackSpeed(longPressSpeed)
+                        isLongPressing = true
+                        showLongPressSpeedFeedback = true
+                    },
+                    onPress = {
+                        tryAwaitRelease()
+                        if (isLongPressing) {
+                            exoPlayer.setPlaybackSpeed(longPressOriginSpeed)
+                            isLongPressing = false
+                            showLongPressSpeedFeedback = false
+                        }
+                    }
+                )
+            }
+            // 进度调整手势
+            .pointerInput(progressState.duration) {
+                detectHorizontalDragGestures(
+                    onDragStart = { 
+                        if (isCurrentPage && progressState.duration > 0) {
+                            isSeekGesture = true
+                            seekStartPosition = exoPlayer.currentPosition.toFloat()
+                            seekTargetPosition = seekStartPosition
+                        }
+                    },
+                    onDragEnd = {
+                        if (isCurrentPage && isSeekGesture) {
+                            exoPlayer.seekTo(seekTargetPosition.toLong())
+                            danmakuManager.seekTo(seekTargetPosition.toLong())
+                            isSeekGesture = false
+                        }
+                    },
+                    onDragCancel = { isSeekGesture = false },
+                    onHorizontalDrag = { _, dragAmount ->
+                        if (isCurrentPage && isSeekGesture && progressState.duration > 0) {
+                            val seekDelta = (dragAmount / size.width) * progressState.duration * 0.75f
+                            seekTargetPosition = (seekTargetPosition + seekDelta).coerceIn(0f, progressState.duration.toFloat())
+                        }
+                    }
+                )
+            }
+    ) {
+        // [核心逻辑]
+        // 始终保留 AndroidView 以确保 Surface 准备就绪，但只有当播放器加载了当前视频时才将其绑定或显示
+        // 否则显示封面
+        
+        if (isCurrentPage && isPlayerReadyForThisVideo) {
+            BoxWithConstraints(
+                modifier = Modifier.fillMaxSize()
+            ) {
+                val safeAspect = currentVideoAspect.coerceAtLeast(0.1f)
+                val containerAspect = if (maxHeight.value > 0f) {
+                    maxWidth.value / maxHeight.value
+                } else {
+                    safeAspect
+                }
+                val viewportHeight = if (safeAspect > containerAspect) {
+                    maxWidth / safeAspect
+                } else {
+                    maxHeight
+                }
+                val viewportWidth = if (safeAspect > containerAspect) {
+                    maxWidth
+                } else {
+                    maxHeight * safeAspect
+                }
+
+                Box(
+                    modifier = Modifier
+                        .size(
+                            width = viewportWidth.coerceAtMost(maxWidth),
+                            height = viewportHeight.coerceAtMost(maxHeight)
+                        )
+                        .align(Alignment.Center)
+                ) {
+                    key(currentPlayingBvid, bvid) {
+                        AndroidView(
+                            factory = { ctx ->
+                                PlayerView(ctx).apply {
+                                    playerViewRef = this
+                                    player = exoPlayer
+                                    useController = false
+                                    keepScreenOn = true
+                                    setKeepContentOnPlayerReset(true)
+                                    setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
+                                    setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
+                                }
+                            },
+                            update = { view ->
+                                playerViewRef = view
+                                if (view.player != exoPlayer) {
+                                    view.player = exoPlayer
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+
+                        if (danmakuEnabled) {
+                            AndroidView(
+                                factory = { ctx ->
+                                    FaceOcclusionDanmakuContainer(ctx).apply {
+                                        setMasks(faceVisualMasks)
+                                        setVideoViewport(
+                                            videoWidth = exoPlayer.videoSize.width,
+                                            videoHeight = exoPlayer.videoSize.height,
+                                            resizeMode = VideoAspectRatio.FIT.resizeMode
+                                        )
+                                        danmakuManager.attachView(danmakuView())
+                                    }
+                                },
+                                update = { container ->
+                                    container.setMasks(faceVisualMasks)
+                                    container.setVideoViewport(
+                                        videoWidth = exoPlayer.videoSize.width,
+                                        videoHeight = exoPlayer.videoSize.height,
+                                        resizeMode = playerViewRef?.resizeMode ?: VideoAspectRatio.FIT.resizeMode
+                                    )
+                                    val view = container.danmakuView()
+                                    if (view.width > 0 && view.height > 0) {
+                                        val sizeTag = "${view.width}x${view.height}"
+                                        if (view.tag != sizeTag) {
+                                            view.tag = sizeTag
+                                            danmakuManager.attachView(view)
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 封面图 (在加载中、未匹配到视频、或未开始播放时显示)
+        val showCover = shouldShowPortraitCover(
+            isLoading = isLoading,
+            isCurrentPage = isCurrentPage,
+            isPlayerReadyForThisVideo = isPlayerReadyForThisVideo,
+            hasRenderedFirstFrame = hasRenderedFirstFrame
+        )
+        
+        if (showCover) {
+            AsyncImage(
+                model = FormatUtils.fixImageUrl(cover),
+                contentDescription = null,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black), // 避免透明底
+                contentScale = ContentScale.Crop
+            )
+            
+            if (isLoading && isCurrentPage) {
+                CircularProgressIndicator(
+                    modifier = Modifier.align(Alignment.Center),
+                    color = Color.White
+                )
+            }
+        }
+
+        // 暂停图标 (仅当前页且暂停时显示)
+        // [修复] 使用响应式的 isPlaying 状态
+        val showPauseIcon = shouldShowPortraitPauseIcon(
+            isCurrentPage = isCurrentPage,
+            isPlaying = isPlaying,
+            playWhenReady = exoPlayer.playWhenReady,
+            isLoading = isLoading,
+            isSeekGesture = isSeekGesture
+        )
+        if (showPauseIcon) {
+            Icon(
+                imageVector = Icons.Filled.PlayArrow,
+                contentDescription = "Pause",
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .size(60.dp),
+                tint = Color.White.copy(alpha = 0.8f)
+            )
+        }
+        
+        // 滑动进度提示
+        if (isSeekGesture && progressState.duration > 0) {
+            val targetTimeText = FormatUtils.formatDuration(seekTargetPosition.toLong())
+            val totalTimeText = FormatUtils.formatDuration(progressState.duration)
+            val deltaMs = (seekTargetPosition - seekStartPosition).toLong()
+            val deltaText = if (deltaMs >= 0) "+${FormatUtils.formatDuration(deltaMs)}" else "-${FormatUtils.formatDuration(-deltaMs)}"
+            
+            Column(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(Color.Black.copy(alpha = 0.7f), androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
+                    .padding(horizontal = 24.dp, vertical = 16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                androidx.compose.material3.Text(
+                    text = "$targetTimeText / $totalTimeText",
+                    color = Color.White,
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                androidx.compose.material3.Text(
+                    text = deltaText,
+                    color = if (deltaMs >= 0) Color(0xFF66FF66) else Color(0xFFFF6666),
+                    fontSize = 14.sp
+                )
+            }
+        }
+
+        if (showLongPressSpeedFeedback && isCurrentPage) {
+            Text(
+                text = "${longPressSpeed}x",
+                color = Color.White,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .background(
+                        Color.Black.copy(alpha = 0.75f),
+                        androidx.compose.foundation.shape.RoundedCornerShape(12.dp)
+                    )
+                    .padding(horizontal = 18.dp, vertical = 10.dp)
+            )
+        }
+
+        // Overlay & Interaction
+    val currentUiState = viewModel.uiState.collectAsState().value
+    val isCurrentModelVideo = (currentUiState as? PlayerUiState.Success)?.info?.bvid == bvid
+    val currentSuccess = currentUiState as? PlayerUiState.Success
+    val stat = if (item is ViewInfo) item.stat else (item as RelatedVideo).stat
+    val isFollowing = (currentUiState as? PlayerUiState.Success)?.followingMids?.contains(authorMid) == true
+    val fallbackDetailInfo = when (item) {
+        is ViewInfo -> item
+        is RelatedVideo -> toViewInfoForPortraitDetail(item)
+        else -> null
+    }
+    val portraitDetailInfo = if (isCurrentModelVideo && currentSuccess != null) {
+        currentSuccess.info
+    } else {
+        fallbackDetailInfo
+    }
+    val detailVideoList = remember(bvid, watchLaterVideos, recommendationVideos) {
+        buildPortraitDetailVideoList(
+            currentBvid = bvid,
+            watchLaterVideos = watchLaterVideos,
+            recommendationVideos = recommendationVideos
+        )
+    }
+    val upOnlyVideos = remember(detailVideoList.videos, authorMid, bvid) {
+        detailVideoList.videos.filter { candidate ->
+            candidate.owner.mid == authorMid && candidate.bvid != bvid
+        }
+    }
+    val detailSheetTitle = remember(detailSheetUpOnlyMode, recommendationVideos.size, upOnlyVideos.size) {
+        if (detailSheetUpOnlyMode) {
+            if (upOnlyVideos.isEmpty()) "该 UP 暂无可切换视频" else "UP 主视频"
+        } else {
+            detailVideoList.title
+        }
+    }
+    val detailSheetVideos = remember(detailSheetUpOnlyMode, upOnlyVideos, detailVideoList.videos) {
+        if (detailSheetUpOnlyMode) upOnlyVideos else detailVideoList.videos
+    }
+    val toggleDanmaku: () -> Unit = {
+        val next = !danmakuEnabled
+        danmakuManager.isEnabled = next
+        scope.launch {
+            SettingsManager.setDanmakuEnabled(context, next)
+        }
+        Unit
+    }
+
+    LaunchedEffect(isCurrentPage, authorMid) {
+        if (isCurrentPage && authorMid > 0L) {
+            viewModel.ensureFollowStatus(authorMid)
+        }
+    }
+
+    PortraitFullscreenOverlay(
+            title = title,
+            authorName = authorName,
+            authorFace = authorFace,
+            isPlaying = if (isCurrentPage) isPlaying else false,
+            progress = progressState,
+            
+            statView = if(isCurrentModelVideo && currentSuccess != null) currentSuccess.info.stat.view else stat.view,
+            statLike = if(isCurrentModelVideo && currentSuccess != null) currentSuccess.info.stat.like else stat.like,
+            statDanmaku = if(isCurrentModelVideo && currentSuccess != null) currentSuccess.info.stat.danmaku else stat.danmaku,
+            statReply = if(isCurrentModelVideo && currentSuccess != null) currentSuccess.info.stat.reply else stat.reply,
+            statFavorite = if(isCurrentModelVideo && currentSuccess != null) currentSuccess.info.stat.favorite else stat.favorite,
+            statShare = if(isCurrentModelVideo && currentSuccess != null) currentSuccess.info.stat.share else stat.share,
+            
+            isLiked = if(isCurrentModelVideo) currentSuccess?.isLiked == true else false,
+            isCoined = false,
+            isFavorited = if(isCurrentModelVideo) currentSuccess?.isFavorited == true else false,
+            
+            isFollowing = isFollowing,
+            onFollowClick = { 
+                viewModel.toggleFollow(authorMid, isFollowing)
+            },
+            
+            onDetailClick = {
+                if (portraitDetailInfo != null) {
+                    detailSheetUpOnlyMode = false
+                    showDetailSheet = true
+                }
+            },
+            onTitleClick = {
+                if (portraitDetailInfo != null) {
+                    detailSheetUpOnlyMode = false
+                    showDetailSheet = true
+                }
+            },
+            onAuthorClick = {
+                if (portraitDetailInfo != null) {
+                    detailSheetUpOnlyMode = true
+                    showDetailSheet = true
+                }
+            },
+            onLikeClick = { if (isCurrentModelVideo) viewModel.toggleLike() },
+            onCoinClick = { },
+            onFavoriteClick = { if (isCurrentModelVideo) viewModel.showFavoriteFolderDialog() },
+            onCommentClick = { showCommentSheet = true },
+            onShareClick = {
+                val shareText = buildPortraitShareText(title = title, bvid = bvid)
+                val shareIntent = android.content.Intent().apply {
+                    action = android.content.Intent.ACTION_SEND
+                    putExtra(android.content.Intent.EXTRA_TEXT, shareText)
+                    type = "text/plain"
+                }
+                context.startActivity(android.content.Intent.createChooser(shareIntent, "Share too..."))
+            },
+            
+            currentSpeed = 1.0f,
+            currentQualityLabel = "高清",
+            currentRatio = VideoAspectRatio.FIT,
+            danmakuEnabled = danmakuEnabled,
+            isStatusBarHidden = true,
+            
+            onBack = {
+                onExitSnapshot(bvid, exoPlayer.currentPosition)
+                onBack()
+            },
+            onPlayPause = {
+                if (isCurrentPage) {
+                    if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
+                }
+            },
+            onSeek = {
+                if (isCurrentPage) {
+                    exoPlayer.seekTo(it)
+                    danmakuManager.seekTo(it)
+                }
+            },
+            onSeekStart = { },
+            onSpeedClick = { },
+            onQualityClick = { },
+            onRatioClick = { },
+            onDanmakuToggle = toggleDanmaku,
+            onDanmakuInputClick = {
+                if (isCurrentPage) {
+                    viewModel.showDanmakuSendDialog()
+                }
+            },
+            onToggleStatusBar = { },
+            onSearchClick = {
+                onExitSnapshot(bvid, exoPlayer.currentPosition)
+                onSearchClick()
+            },
+            onMoreClick = {
+                showDetailSheet = true
+            },
+            onRotateToLandscape = {
+                onExitSnapshot(bvid, exoPlayer.currentPosition)
+                onRotateToLandscape()
+            },
+            
+            showControls = isOverlayVisible && !showCommentSheet && !showDetailSheet
+        )
+
+        PortraitCommentSheet(
+            visible = showCommentSheet,
+            onDismiss = { showCommentSheet = false },
+            commentViewModel = commentViewModel,
+            aid = aid,
+            upMid = authorMid,
+            onUserClick = onUserClick
+        )
+        
+        PortraitDetailSheet(
+            visible = showDetailSheet,
+            onDismiss = {
+                showDetailSheet = false
+                detailSheetUpOnlyMode = false
+            },
+            info = portraitDetailInfo,
+            recommendationTitle = detailSheetTitle,
+            recommendations = detailSheetVideos,
+            onRecommendationClick = { targetBvid ->
+                showDetailSheet = false
+                detailSheetUpOnlyMode = false
+                onRequestVideoChange(targetBvid)
+            },
+            onAuthorClick = { mid ->
+                showDetailSheet = false
+                detailSheetUpOnlyMode = false
+                onExitSnapshot(bvid, exoPlayer.currentPosition)
+                onUserClick(mid)
+            },
+            danmakuEnabled = danmakuEnabled,
+            onDanmakuToggle = toggleDanmaku
+        )
+    }
+}
+
+internal fun resolvePortraitInitialPageIndex(
+    initialBvid: String,
+    initialInfoBvid: String,
+    recommendations: List<RelatedVideo>
+): Int {
+    if (initialBvid == initialInfoBvid) return 0
+    val recommendationIndex = recommendations.indexOfFirst { it.bvid == initialBvid }
+    if (recommendationIndex < 0) return 0
+    return recommendationIndex + 1
+}

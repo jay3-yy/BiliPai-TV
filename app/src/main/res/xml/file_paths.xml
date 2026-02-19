@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 日志缓存目录 -->
+    <cache-path
+        name="logs"
+        path="logs/" />
+    
+    <!-- 外部 Download 目录（用于日志导出） -->
+    <external-path
+        name="external_downloads"
+        path="Download/BiliPai/" />
+</paths>

@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">BiliPai</string>
+    
+    <!-- App Shortcuts -->
+    <string name="shortcut_search_short">搜索</string>
+    <string name="shortcut_search_long">搜索视频</string>
+    <string name="shortcut_dynamic_short">动态</string>
+    <string name="shortcut_dynamic_long">查看动态</string>
+    <string name="shortcut_favorite_short">收藏</string>
+    <string name="shortcut_favorite_long">我的收藏</string>
+    <string name="shortcut_history_short">历史</string>
+    <string name="shortcut_history_long">观看历史</string>
+</resources>

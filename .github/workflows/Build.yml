@@ -1,0 +1,117 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        type: choice
+        description: '选择编译类型'
+        required: true
+        default: 'debug'
+        options:
+          - 'debug'
+          - 'release'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  check-fcm:
+    runs-on: ubuntu-latest
+    outputs:
+      has_fcm: ${{ steps.check.outputs.has_fcm }}
+    steps:
+      - name: Check FCM configuration
+        id: check
+        run: |
+          if [ -n "${{ secrets.FCM }}" ]; then
+            echo "FCM secret is configured"
+            echo "has_fcm=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ FCM secret is not configured. Workflow will not run."
+            echo "has_fcm=false" >> $GITHUB_OUTPUT
+          fi
+  
+  build:
+    runs-on: ubuntu-latest
+    needs: check-fcm
+    if: needs.check-fcm.outputs.has_fcm == 'true'
+    env:
+      NATIVE_TARGET: "arm64-v8a"
+    steps:
+      - name: ⬇️ Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Set Build Type
+        id: set_build_type
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "build_type=${{ github.event.inputs.build_type }}" >> $GITHUB_OUTPUT
+          else
+            echo "build_type=debug" >> $GITHUB_OUTPUT
+          fi
+          echo "构建类型: ${{ steps.set_build_type.outputs.build_type }}"
+  
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+  
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v3
+  
+      - name: Grant execute permission to gradlew
+        run: chmod +x gradlew
+        
+      - name: Set Up FCM Config
+        run: |
+          cd ./app
+          echo "${{ secrets.FCM }}" | base64 -d > google-services.json
+  
+      - name: Build APK
+        run: |
+          if [ "${{ steps.set_build_type.outputs.build_type }}" = "release" ]; then
+            ./gradlew assembleRelease
+          else
+            ./gradlew assembleDebug
+          fi
+  
+      - name: Find and upload APK files
+        id: find_apks
+        run: |
+          # 查找所有 APK 文件
+          APK_FILES=$(find ${{ github.workspace }}/app/build/outputs/apk/ -name "*.apk" -type f)
+          
+          if [ -z "$APK_FILES" ]; then
+            echo "No APK files found"
+            exit 1
+          fi
+          
+          # 将找到的 APK 文件路径输出为多行字符串
+          echo "apk_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$APK_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "Found APK files:"
+          echo "$APK_FILES"
+      
+      - name: Upload APK Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: BiliPai
+          path: ${{ steps.find_apks.outputs.apk_files }}
+          retention-days: 7
+          if-no-files-found: error
+
+  skipped-due-to-no-fcm:
+    runs-on: ubuntu-latest
+    needs: check-fcm
+    if: needs.check-fcm.outputs.has_fcm == 'false'
+    steps:
+      - name: Workflow Skipped
+        run: |
+          echo "❌ Workflow skipped because FCM secret is not configured."
+          echo "Please configure the FCM secret in the repository settings."
